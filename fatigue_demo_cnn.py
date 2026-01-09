@@ -41,35 +41,27 @@ except Exception:
     USE_TORCH = False
 
 # ======================
-# AI 캐릭터 이미지
+# Character images
 # ======================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.getcwd()
 
-def load_png(name):
+def load_char(name, w=120):
     path = os.path.join(BASE_DIR, name)
-    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+
+    # 🔥 Windows + 한글 경로 대응 (cv2.imread 대체)
+    data = np.fromfile(path, dtype=np.uint8)
+    img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
+
     if img is None:
-        print(f"[PNG LOAD FAIL] {path}")
-    else:
-        print(f"[PNG OK] {path} {img.shape}")
-    return img
+        raise RuntimeError(f"Character image not found: {path}")
 
-CHAR_IMAGES = {
-    "NORMAL": [
-        load_png("1.png"),
-        load_png("2.png"),
-    ],
-    "CONSCIOUS_DRIFT": [
-        load_png("3.png"),
-        load_png("4.png"),
-    ],
-    "UNCONSCIOUS_DRIFT": [
-        load_png("5.png"),
-        load_png("6.png"),
-    ],
-}
+    h0, w0 = img.shape[:2]
+    scale = w / w0
+    return cv2.resize(img, (int(w0 * scale), int(h0 * scale)))
 
 
+CHAR_NORMAL = load_char("0.png")
+CHAR_UNCON  = load_char("1.png")
 
 # ======================
 # 설정
@@ -154,21 +146,6 @@ def put_text_pil(img_bgr, text, org, font, color=(255, 255, 255)):
 def clamp(x, a, b):
     return max(a, min(b, x))
 
-def overlay_png(bg, fg, x, y):
-    h, w = fg.shape[:2]
-    if fg.shape[2] < 4:
-        bg[y:y+h, x:x+w] = fg
-        return bg
-
-    alpha = fg[:, :, 3] / 255.0
-    for c in range(3):
-        bg[y:y+h, x:x+w, c] = (
-            alpha * fg[:, :, c] +
-            (1 - alpha) * bg[y:y+h, x:x+w, c]
-        )
-    return bg
-
-
 # ======================
 # MediaPipe
 # ======================
@@ -208,7 +185,6 @@ def mouth_open_ratio(lm, w, h):
     mouth_h = _dist(upper, lower)
     return mouth_h / mouth_w
 
-
 def play_ding():
     try:
         import platform
@@ -230,7 +206,6 @@ def play_ding():
 
     except Exception as e:
         print("[WARN] sound play failed:", e)
-
 
 # ======================
 # OS Event Aggregator
@@ -617,11 +592,8 @@ def append_jsonl(path: str, obj: dict):
 def main():
     global EAR_THRESH, MAR_THRESH
 
-    prev_state = None
-    current_char_img = None
-    state = "NORMAL"
-    
     agg = EventAgg()
+    current_char = CHAR_NORMAL.copy()
     latest_features = None
 
     START_TIME = time.time()
@@ -739,12 +711,6 @@ def main():
         state = "NORMAL"
 
         while True:
-            if prev_state is None:
-                candidates = [img for img in CHAR_IMAGES["NORMAL"] if img is not None]
-                if candidates:
-                    current_char_img = random.choice(candidates)
-                    prev_state = "NORMAL"
-                    print("[CHAR INIT] NORMAL")
             ok, frame = cap.read()
             if not ok:
                 break
@@ -878,6 +844,15 @@ def main():
                     else:
                             # ⚠️ 의식 이탈은 지금 단계에서 무시
                         state = "NORMAL"
+                    
+                    
+                    # ======================
+                    # Character update logic
+                    # ======================
+                    if state == "UNCONSCIOUS_DRIFT":
+                        current_char = CHAR_UNCON.copy()
+                    else:
+                        current_char = CHAR_NORMAL.copy()
 
 
 
@@ -930,18 +905,6 @@ def main():
         
                 face_missing_sec = missing_frames / FPS_ASSUMED
                 cond_missing = face_missing_sec >= FACE_MISSING_TRIGGER_SEC
-
-                print("[mode]", decision_mode, "| state:", state)
-
-                if state != prev_state:
-                    if state in CHAR_IMAGES:
-                        candidates = [img for img in CHAR_IMAGES[state] if img is not None]
-                        if candidates:
-                            current_char_img = random.choice(candidates)
-                            print(f"[CHAR] state -> {state}")
-                        else:
-                            print(f"[CHAR WARN] no image for {state}")
-                    prev_state = state                
 
 # ✅ 시연용: ←/→ 연타(10회 등) 감지
                 rewind_spam  = len(agg.rewind_keys)  >= SEEK_KEY_TRIGGER_N
@@ -1011,11 +974,28 @@ def main():
             elif selected_plan_msg is not None and now > selected_plan_until:
                 selected_plan_msg = None
 
-
 # ✅ 계획 팝업은 제일 마지막 (rest_mode 아닐 때만)
             if (not rest_mode) and (current_reco is not None):
                 frame = draw_intervention(frame, current_reco)
+            
+            # ======================
+            # Draw character (top-right)
+            # ======================
+            ch, cw = current_char.shape[:2]
+            x = frame.shape[1] - cw - 20
+            y = 100
 
+            if current_char.shape[2] == 4:  # BGRA
+                alpha = current_char[:, :, 3] / 255.0
+                for c in range(3):
+                    frame[y:y+ch, x:x+cw, c] = (
+                        alpha * current_char[:, :, c] +
+                        (1 - alpha) * frame[y:y+ch, x:x+cw, c]
+                    )
+            else:
+                frame[y:y+ch, x:x+cw] = current_char[:, :, :3]
+            
+            cv2.imshow(WINDOW_NAME, frame)
 
             # ------------------------------
             # 키 입력 처리 (cv2)
@@ -1079,22 +1059,6 @@ def main():
                     current_reco = None
 
                     fatigue_event_count = 0
-
-            # =========================
-            # AI 캐릭터 표시 (오른쪽 위)
-            # =========================
-            if current_char_img is not None:
-                ch, cw = current_char_img.shape[:2]
-                x = frame.shape[1] - cw - 20
-                y = 100
-
-                if x >= 0 and y >= 0 and y + ch <= frame.shape[0]:
-                    frame = overlay_png(frame, current_char_img, x, y)
-                else:
-                    print("[CHAR WARN] image out of frame", current_char_img.shape)
-
-
-            cv2.imshow(WINDOW_NAME, frame)
 
     cap.release()
     cv2.destroyAllWindows()
