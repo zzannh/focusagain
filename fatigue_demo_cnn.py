@@ -1,0 +1,1067 @@
+# ===========================
+# fatigue_demo_cnn.py
+# - 웹캠 + MediaPipe + OS 이벤트(키/클릭/스크롤) + UI
+# - 5초 요약 feature를 7step(30초)로 모아서 1D-CNN으로
+#     P(unconscious), P(conscious), P(normal) 추론
+# - 추론 결과로 "무의식 이벤트" 카운트 누적 -> 3회면 계획 팝업
+# - 모델 파일이 없으면(또는 torch 없으면) 기존 규칙 기반으로 fallback
+#
+# 실행:
+#   python fatigue_demo_cnn.py
+# 옵션:
+#   - MODEL_PATH에 학습된 .pt 경로 넣으면 CNN 사용
+#   - R 키: jsonl 로깅 토글 (30초 시퀀스 단위 저장)
+#   - L 키: LectureActive 토글 (강의 듣는 중/최소화 느낌 데모)
+#   - F9/F10/F11/F12 디버그는 기존 유지
+# ===========================
+
+
+import os
+import cv2
+import time
+import math
+import random
+import numpy as np
+from collections import deque
+import mediapipe as mp
+from pynput import keyboard, mouse
+
+# PIL (한글 UI)
+from PIL import Image, ImageDraw, ImageFont
+
+# -----------------------
+# (선택) PyTorch
+# -----------------------
+USE_TORCH = True
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+except Exception:
+    USE_TORCH = False
+
+# ======================
+# Character images
+# ======================
+BASE_DIR = os.getcwd()
+
+def load_char(name, w=120):
+    path = os.path.join(BASE_DIR, name)
+
+    # 🔥 Windows + 한글 경로 대응 (cv2.imread 대체)
+    data = np.fromfile(path, dtype=np.uint8)
+    img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
+
+    if img is None:
+        raise RuntimeError(f"Character image not found: {path}")
+
+    h0, w0 = img.shape[:2]
+    scale = w / w0
+    return cv2.resize(img, (int(w0 * scale), int(h0 * scale)))
+
+
+CHAR_NORMAL = load_char("0.png")
+CHAR_UNCON  = load_char("1.png")
+
+# ======================
+# 설정
+# ======================
+FPS_ASSUMED = 15
+WINDOW_SEC = 5.0
+SEQ_STEPS = 7  # 30초 = 5초*7step
+
+# 규칙 기반 fallback 기준
+EAR_THRESH = 0.21
+DROWSY_RATIO = 0.30
+SLEEP_SEC = 3.0
+MAR_THRESH = 0.55
+
+SEEK_KEY_WINDOW_SEC = 2.0
+SEEK_KEY_TRIGGER_N = 10
+
+
+# Intervention
+FATIGUE_EVENT_TRIGGER_N = 3
+INTERVENTION_COOLDOWN_SEC = 60.0
+
+FATIGUE_PLANS_9 = [
+    "물 한 모금 마시기",
+    "20초 동안 목/어깨 스트레칭",
+    "자리에서 일어나 1분 걷기",
+    "창밖 20초 보기(눈 휴식)",
+    "5분 타이머 휴식 후 재시작",
+    "강의 속도 0.75x로 낮추고 2분만 듣기",
+    "지금 구간을 3줄로 요약 노트 작성",
+    "다음 슬라이드/목차만 훑고 복귀",
+    "창문 열고 환기 1분 하기",
+]
+
+WINDOW_NAME = "Fatigue Demo (CNN Decision)"
+
+# CNN 모델 파일(있으면 사용)
+MODEL_PATH = "cnn_1d_pretrained.pt"  # 없으면 fallback
+DEVICE = "cpu"
+
+# 로깅(jsonl)
+LOG_JSONL_PATH = "demo_sequences.jsonl"
+ENABLE_LOGGING_DEFAULT = False
+
+# CNN decision threshold (발표용 임계값)
+P_UNCONSCIOUS_THRESH = 0.60
+P_CONSCIOUS_THRESH = 0.60
+
+# ======================
+# PIL Font (한글)
+# ======================
+def _load_font(size: int):
+    candidates = [
+        # Windows
+        "C:/Windows/Fonts/malgun.ttf",
+        "C:/Windows/Fonts/malgunbd.ttf",
+        # Linux
+        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+
+        # macOS (한글 폰트 후보)
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+        "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+        "/Library/Fonts/AppleGothic.ttf",
+    ]
+    for p in candidates:
+        try:
+            return ImageFont.truetype(p, size)
+        except Exception:
+            pass
+    # ⚠️ load_default()는 크기 조절이 거의 안 돼서 UI가 망가져 보일 수 있음
+    return ImageFont.load_default()
+
+
+def put_text_pil(img_bgr, text, org, font, color=(255, 255, 255)):
+    x, y = org
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(img_rgb)
+    draw = ImageDraw.Draw(pil_img)
+    draw.text((x, y), text, font=font, fill=(color[0], color[1], color[2]))
+    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+def clamp(x, a, b):
+    return max(a, min(b, x))
+
+# ======================
+# MediaPipe
+# ======================
+mp_face_mesh = mp.solutions.face_mesh
+
+LEFT_EYE = {"outer": 33, "inner": 133, "top": 159, "bottom": 145}
+RIGHT_EYE = {"outer": 362, "inner": 263, "top": 386, "bottom": 374}
+LEFT_IRIS = [468, 469, 470, 471]
+RIGHT_IRIS = [473, 474, 475, 476]
+
+POSE_LM = {"nose": 1, "chin": 199, "l_eye": 33, "r_eye": 263, "l_mouth": 61, "r_mouth": 291}
+MODEL_3D = np.array([
+    (0, 0, 0), (0, -63.6, -12.5), (-43.3, 32.7, -26), (43.3, 32.7, -26),
+    (-28.9, -28.9, -24.1), (28.9, -28.9, -24.1)
+], dtype=np.float64)
+
+MOUTH = {"left": 61, "right": 291, "upper": 13, "lower": 14}
+
+# ======================
+# Utils
+# ======================
+def _dist(a, b):
+    a = np.array(a, dtype=np.float32)
+    b = np.array(b, dtype=np.float32)
+    return float(np.linalg.norm(a - b))
+
+def ear_for_eye(p):
+    return _dist(p["top"], p["bottom"]) / (_dist(p["outer"], p["inner"]) + 1e-6)
+
+def mouth_open_ratio(lm, w, h):
+    def xy(i): return (lm[i].x * w, lm[i].y * h)
+    left = xy(MOUTH["left"])
+    right = xy(MOUTH["right"])
+    upper = xy(MOUTH["upper"])
+    lower = xy(MOUTH["lower"])
+    mouth_w = _dist(left, right) + 1e-6
+    mouth_h = _dist(upper, lower)
+    return mouth_h / mouth_w
+
+def play_ding():
+    try:
+        import platform
+        system = platform.system()
+
+        if system == "Darwin":  # macOS
+            os.system("afplay /System/Library/Sounds/Glass.aiff")
+
+        elif system == "Windows":
+            try:
+                from playsound import playsound
+                playsound("ding.wav")
+            except ImportError:
+                import winsound
+                winsound.Beep(1000, 300)
+
+        else:
+            print("[INFO] Sound not supported on this OS")
+
+    except Exception as e:
+        print("[WARN] sound play failed:", e)
+
+# ======================
+# OS Event Aggregator
+# ======================
+class EventAgg:
+    def __init__(self):
+        self.events = deque()
+        self.task_events = deque()
+        self.scrolls = deque()
+        self.rewind_keys = deque()
+        self.forward_keys = deque()
+
+
+    def _prune(self, now):
+        cut = now - WINDOW_SEC
+        while self.events and self.events[0][0] < cut:
+            self.events.popleft()
+        while self.task_events and self.task_events[0][0] < cut:
+            self.task_events.popleft()
+        while self.scrolls and self.scrolls[0] < cut:
+            self.scrolls.popleft()
+
+    def add(self, kind):
+        now = time.time()
+        self.events.append((now, kind))
+        if kind in ("key", "click"):
+            self.task_events.append((now, kind))
+        if kind == "scroll":
+            self.scrolls.append(now)
+        self._prune(now)
+
+    def add_seek_key(self, direction, window_sec=SEEK_KEY_WINDOW_SEC):
+        now = time.time()
+        if direction == "rewind":
+            self.rewind_keys.append(now)
+            while self.rewind_keys and self.rewind_keys[0] < now - window_sec:
+                self.rewind_keys.popleft()
+        else:
+            self.forward_keys.append(now)
+            while self.forward_keys and self.forward_keys[0] < now - window_sec:
+                self.forward_keys.popleft()
+
+
+    def metrics(self):
+        now = time.time()
+        self._prune(now)
+
+        task_input = len(self.task_events)
+        scroll_cnt = len(self.scrolls)
+
+        input_event = 0.0
+        if len(self.events) >= 3:
+            ts = np.diff([t for t, _ in self.events])
+            m, s = ts.mean(), ts.std()
+            if m > 1e-6:
+                input_event = clamp((s / m) / 3, 0, 1)
+
+        return task_input, input_event, scroll_cnt
+
+# ======================
+# Vision extraction
+# ======================
+def iris_center(lm, ids, w, h):
+    pts = np.array([(lm[i].x * w, lm[i].y * h) for i in ids])
+    return pts.mean(axis=0)
+
+def gaze_xy(lm, w, h):
+    def xy(i): return np.array((lm[i].x * w, lm[i].y * h))
+    iris = (iris_center(lm, LEFT_IRIS, w, h) + iris_center(lm, RIGHT_IRIS, w, h)) / 2
+    eye_l = (xy(LEFT_EYE["outer"]) + xy(RIGHT_EYE["inner"])) / 2
+    eye_r = (xy(LEFT_EYE["inner"]) + xy(RIGHT_EYE["outer"])) / 2
+    w_eye = _dist(eye_l, eye_r) + 1e-6
+    center = (eye_l + eye_r) / 2
+    gx = clamp((iris[0] - center[0]) / (0.5 * w_eye), -1, 1)
+    gy = clamp((iris[1] - center[1]) / (0.5 * w_eye), -1, 1)
+    return float(gx), float(gy)
+
+def head_pose(lm, w, h):
+    def xy(i): return (lm[i].x * w, lm[i].y * h)
+    img = np.array([xy(POSE_LM[k]) for k in POSE_LM], dtype=np.float64)
+    cam = np.array([[w, 0, w / 2], [0, w, h / 2], [0, 0, 1]], dtype=np.float64)
+    ok, rvec, _ = cv2.solvePnP(MODEL_3D, img, cam, np.zeros((4, 1)))
+    if not ok:
+        return 0.0, 0.0, 0.0
+    R, _ = cv2.Rodrigues(rvec)
+    pitch = math.degrees(math.atan2(R[2, 1], R[2, 2]))
+    yaw = math.degrees(math.atan2(-R[2, 0], math.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)))
+    roll = math.degrees(math.atan2(R[1, 0], R[0, 0]))
+    return float(yaw), float(roll), float(pitch)
+
+# ======================
+# State logic (fallback: eyes only)
+# ======================
+closed_hist = deque(maxlen=int(FPS_ASSUMED * WINDOW_SEC))
+closed_streak = 0
+
+def update_state_fallback(eyes_closed):
+    global closed_streak
+    closed_hist.append(1 if eyes_closed else 0)
+    closed_streak = closed_streak + 1 if eyes_closed else 0
+
+    ratio = sum(closed_hist) / max(1, len(closed_hist))
+    if closed_streak / FPS_ASSUMED >= SLEEP_SEC:
+        return "SLEEP"
+    if ratio >= DROWSY_RATIO:
+        return "DROWSY"
+    return "NORMAL"
+
+# ======================
+# Feature vector for CNN
+# ======================
+# 8채널 고정(권장):
+# 1) gaze_x, 2) gaze_y, 3) head_pitch,
+# 4) eyes_open_ratio, 5) mouth_open_ratio,
+# 6) task_input_norm, 7) input_event, 8) lecture_active
+FEAT_NAMES = [
+    "gaze_x", "gaze_y", "head_pitch",
+    "eyes_open", "mouth_open",
+    "task_input", "input_event",
+    "lecture_active"
+]
+
+def normalize_feature_vec(v: dict) -> np.ndarray:
+    """
+    간단 정규화 (발표용):
+    - gaze/head는 이미 대략 범위 제한
+    - head_pitch(deg)는 [-30~30] 기준으로 -1~1로 축소
+    - task_input은 5초 윈도우에서 0~20 정도로 보고 0~1로 축소
+    """
+    gx = float(clamp(v["GazeX"], -1, 1))
+    gy = float(clamp(v["GazeY"], -1, 1))
+
+    hp_deg = float(v["HeadPitch"])
+    hp = float(clamp(hp_deg / 30.0, -1, 1))
+
+    eyes_open = float(clamp(v["Eyes"], 0, 1))
+    mouth_open = float(clamp(v["MouthOpen"], 0, 1))
+
+    task_input = float(v["TaskInput"])
+    task_input_norm = float(clamp(task_input / 20.0, 0, 1))
+
+    input_event = float(clamp(v["InputEvent"], 0, 1))
+    lecture_active = float(v.get("LectureActive", 1.0))
+    lecture_active = float(clamp(lecture_active, 0, 1))
+
+    arr = np.array([gx, gy, hp, eyes_open, mouth_open, task_input_norm, input_event, lecture_active], dtype=np.float32)
+    return arr
+
+# ======================
+# 1D-CNN 모델 정의(추론/학습 공용)
+# ======================
+class Simple1DCNN(nn.Module):
+    """
+    입력: (B, C=8, T=7)
+    출력: logits (B, 3)  # [normal, conscious, unconscious]
+    """
+    def __init__(self, c_in=8, n_classes=3):
+        super().__init__()
+        self.conv1 = nn.Conv1d(c_in, 32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(32, 64, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv1d(64, 64, kernel_size=3, padding=1)
+        self.dropout = nn.Dropout(0.15)
+        self.fc1 = nn.Linear(64, 64)
+        self.fc2 = nn.Linear(64, n_classes)
+
+    def forward(self, x):
+        # x: (B,C,T)
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = self.dropout(F.relu(self.conv3(x)))
+        # global average pooling over time
+        x = x.mean(dim=-1)  # (B, 64)
+        x = self.dropout(F.relu(self.fc1(x)))
+        return self.fc2(x)
+
+def try_load_model(path: str):
+    if not USE_TORCH:
+        return None
+    try:
+        model = Simple1DCNN(c_in=len(FEAT_NAMES), n_classes=3)
+        sd = torch.load(path, map_location=DEVICE)
+        model.load_state_dict(sd)
+        model.eval()
+        return model
+    except Exception as e:
+        print("[WARN] model load failed -> fallback:", e)
+        return None
+
+# ======================
+# UI
+# ======================
+def draw_ui(frame, state, lecture_active, p=None):
+    h, w = frame.shape[:2]
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (w, 90), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+
+    txt = f"STATE: {state}   |   LectureActive: {int(lecture_active)}"
+    cv2.putText(frame, txt, (20, 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3, cv2.LINE_AA)
+
+    # CNN 확률 표시(있으면)
+    if p is not None:
+        pn, pc, pu = p
+        cv2.putText(frame, f"CNN P(normal)={pn:.2f}  P(conscious)={pc:.2f}  P(unconscious)={pu:.2f}",
+                    (20, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 2, cv2.LINE_AA)
+
+    return frame
+
+def draw_features(frame, features):
+    if features is None:
+        return frame
+    x, y = 20, 220
+    line_h = 28
+    overlay = frame.copy()
+    box_h = line_h * (len(features) + 1)
+    cv2.rectangle(overlay, (x - 10, y - 30), (x + 560, y + box_h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+
+    for i, (k, v) in enumerate(features.items()):
+        txt = f"{k}: {v:.2f}" if isinstance(v, float) else f"{k}: {v}"
+        cv2.putText(frame, txt, (x, y + i * line_h),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+    return frame
+
+def draw_debug(frame, enabled, fatigue_count, cooldown_left, logging_on):
+    if not enabled:
+        return frame
+    x, y = 20, 120
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x - 10, y - 30), (x + 820, y + 140), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+
+    cv2.putText(frame, "DEBUG: F12(+1), F11(reset), F10(force popup), F9(toggle) | L(lecture) | R(log)",
+                (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(frame, f"fatigue_event_count = {fatigue_count}/{FATIGUE_EVENT_TRIGGER_N}",
+                (x, y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(frame, f"cooldown_left = {cooldown_left:.1f}s   | logging={int(logging_on)} ({LOG_JSONL_PATH})",
+                (x, y + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
+    return frame
+
+def draw_intervention(frame, plans3):
+    h, w = frame.shape[:2]
+    box_w = int(min(w * 0.82, 980))
+    box_h = int(min(h * 0.45, 360))
+    x = (w - box_w) // 2
+    y = (h - box_h) // 2
+
+    # 반투명 박스
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x, y), (x + box_w, y + box_h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.72, frame, 0.28, 0, frame)
+
+    # 폰트 크기
+    title_size = int(clamp(box_h * 0.14, 26, 44))
+    body_size  = int(clamp(box_h * 0.10, 20, 34))
+    font_title = _load_font(title_size)
+    font_body  = _load_font(body_size)
+
+    pad_x = int(box_w * 0.05)
+    pad_y = int(box_h * 0.08)
+    line_gap = int(body_size * 1.55)
+
+    # ✅ PIL로 한 번만 그리기
+    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(img_rgb)
+    draw = ImageDraw.Draw(pil_img)
+
+    def t(org, text, font, color):
+        draw.text(org, text, font=font, fill=color)
+
+    t((x + pad_x, y + pad_y), "피로 - 강의 듣는 중 (계획 추천)", font_title, (255, 255, 255))
+    t((x + pad_x, y + pad_y + int(title_size * 1.3)), "1/2/3 키로 하나를 선택하세요", font_body, (200, 200, 200))
+
+    base_y = y + pad_y + int(title_size * 1.3) + int(body_size * 1.6)
+    for i, p in enumerate(plans3):
+        t((x + pad_x, base_y + i * line_gap), f"{i + 1}. {p}", font_body, (255, 255, 255))
+
+    frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    return frame
+
+
+def draw_selected_banner(frame, msg):
+    h, w = frame.shape[:2]
+    banner_w = int(min(w * 0.88, 1100))
+    banner_h = int(min(h * 0.16, 120))
+    x = (w - banner_w) // 2
+    y = int(h * 0.12)
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x, y), (x + banner_w, y + banner_h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
+
+    font_size = int(clamp(banner_h * 0.45, 20, 44))
+    font = _load_font(font_size)
+
+    pad_x = int(banner_w * 0.04)
+    pad_y = int(banner_h * 0.20)
+    frame = put_text_pil(frame, msg, (x + pad_x, y + pad_y), font, (180, 255, 180))
+    return frame
+
+def draw_break_popup(frame):
+    h, w = frame.shape[:2]
+    box_w = int(min(w * 0.82, 980))
+    box_h = int(min(h * 0.32, 260))
+    x = (w - box_w) // 2
+    y = (h - box_h) // 2
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x, y), (x + box_w, y + box_h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+
+    title_size = int(clamp(box_h * 0.20, 26, 44))
+    body_size  = int(clamp(box_h * 0.13, 18, 32))
+    font_title = _load_font(title_size)
+    font_body  = _load_font(body_size)
+
+    pad_x = int(box_w * 0.06)
+    pad_y = int(box_h * 0.18)
+
+    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(img_rgb)
+    draw = ImageDraw.Draw(pil_img)
+
+    draw.text((x + pad_x, y + pad_y), "Conscious breakaway!", font=font_title, fill=(255, 255, 255))
+    draw.text((x + pad_x, y + pad_y + int(title_size * 1.25)),
+              "Shall we take a break?", font=font_body, fill=(220, 220, 220))
+    draw.text((x + pad_x, y + pad_y + int(title_size * 1.25) + int(body_size * 1.8)),
+              "1. Yes    /    2. No", font=font_body, fill=(255, 255, 255))
+
+    frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    return frame
+
+
+def draw_rest_mode(frame):
+    """
+    화면 전체를 어둡게 만들고, 중앙에 '웹캠 화면이 갇힌 느낌'으로 박스 영역만 보이게.
+    (원본 프레임을 중앙 박스로 축소해 넣고, 주변은 어둡게)
+    """
+    h, w = frame.shape[:2]
+
+    # 전체 어둡게
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.72, frame, 0.28, 0, frame)
+
+    # 중앙 박스 크기
+    box_w = int(w * 0.58)
+    box_h = int(h * 0.58)
+    x = (w - box_w) // 2
+    y = (h - box_h) // 2
+
+    # 중앙 박스에 원본(살짝 더 어두운) 웹캠 삽입
+    # (현재 frame은 이미 어두워졌으니, 원본 느낌을 내고 싶으면 호출 전 원본을 따로 넘기는 방식도 가능)
+    # 여기서는 "갇힌 느낌"만 구현: 중앙 영역을 조금 더 밝게 보이도록 다시 덮습니다.
+    # -> 중앙만 overlay를 덜 섞어서 상대적으로 밝아 보이게
+    center = frame[y:y+box_h, x:x+box_w].copy()
+    cv2.addWeighted(center, 0.55, np.zeros_like(center), 0.0, 0, center)
+    frame[y:y+box_h, x:x+box_w] = center
+
+    # 테두리
+    cv2.rectangle(frame, (x, y), (x + box_w, y + box_h), (255, 255, 255), 2)
+
+    # 안내 문구
+    font_size = int(clamp(h * 0.04, 20, 38))
+    font = _load_font(font_size)
+    msg = "Rest mode. Press 0 to resume."
+    frame = put_text_pil(frame, msg, (x + 18, y - int(font_size * 1.4)), font, (180, 255, 180))
+
+    return frame
+
+
+# ======================
+# JSONL logging (30초 시퀀스)
+# ======================
+def append_jsonl(path: str, obj: dict):
+    import json
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+# ======================
+# Main
+# ======================
+def main():
+    global EAR_THRESH, MAR_THRESH
+
+    agg = EventAgg()
+    current_char = CHAR_NORMAL.copy()
+    latest_features = None
+
+    START_TIME = time.time()
+    BREAK_WARMUP_SEC = 12.0
+
+
+    fatigue_event_count = 0
+    last_intervention_time = 0.0
+    current_reco = None
+
+        # ----------------------
+    # Conscious Breakaway / Rest mode
+    # ----------------------
+    break_popup = False          # break 질문 팝업 떠 있는지
+    rest_mode = False            # 휴식 모드 진입 여부
+    last_break_popup_time = 0.0
+    BREAK_COOLDOWN_SEC = 45.0    # break 팝업 재등장 쿨타임
+
+    # 얼굴 사라짐 감지용
+    missing_frames = 0
+    FACE_MISSING_TRIGGER_SEC = 2.0
+
+
+    selected_plan_msg = None
+    selected_plan_until = 0.0
+    SELECT_BANNER_SEC = 4.0
+
+    # debug flags
+    debug_force_plus1 = False
+    debug_reset = False
+    debug_force_popup = False
+    debug_overlay = True
+
+    # lecture active (강의 모드 토글)
+    lecture_active = 1
+
+    # logging
+    logging_on = ENABLE_LOGGING_DEFAULT
+
+    # CNN model
+    model = try_load_model(MODEL_PATH)
+    if model is not None:
+        print(f"[INFO] CNN model loaded: {MODEL_PATH}")
+    else:
+        if USE_TORCH:
+            print("[INFO] CNN not used (model missing/failed). fallback logic active.")
+        else:
+            print("[INFO] torch not available. fallback logic active.")
+
+    # feature_history: 7step 시계열
+    feature_history = deque(maxlen=SEQ_STEPS)
+
+    # cnn probs cache
+    last_probs = None  # (p_normal, p_conscious, p_unconscious)
+
+    def on_key_press(k):
+        nonlocal debug_force_plus1, debug_reset, debug_force_popup, debug_overlay
+        nonlocal lecture_active, logging_on
+        try:
+            if k == keyboard.Key.f12:
+                debug_force_plus1 = True
+                print("[DEBUG] F12 -> fatigue_event_count + 1")
+                return
+            if k == keyboard.Key.f11:
+                debug_reset = True
+                print("[DEBUG] F11 -> reset fatigue_event_count")
+                return
+            if k == keyboard.Key.f10:
+                debug_force_popup = True
+                print("[DEBUG] F10 -> force popup (ignore cooldown)")
+                return
+            if k == keyboard.Key.f9:
+                debug_overlay = not debug_overlay
+                print(f"[DEBUG] F9 -> debug_overlay = {debug_overlay}")
+                return
+
+            # L: lecture_active toggle
+            if hasattr(k, "char") and k.char in ("l", "L"):
+                lecture_active = 0 if lecture_active == 1 else 1
+                print(f"[TOGGLE] lecture_active = {lecture_active}")
+                return
+
+            # R: logging toggle
+            if hasattr(k, "char") and k.char in ("r", "R"):
+                logging_on = not logging_on
+                print(f"[TOGGLE] logging_on = {logging_on} -> {LOG_JSONL_PATH}")
+                return
+            
+            if k == keyboard.Key.left:
+                agg.add_seek_key("rewind")
+            elif k == keyboard.Key.right:
+                agg.add_seek_key("forward")
+
+
+            agg.add("key")
+        except Exception:
+            pass
+
+    keyboard.Listener(on_press=on_key_press).start()
+    mouse.Listener(
+        on_click=lambda x, y, b, p: agg.add("click") if p else None,
+        on_scroll=lambda x, y, dx, dy: agg.add("scroll")
+    ).start()
+
+    cap = cv2.VideoCapture(0)
+
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_NAME, 820, 460)
+
+    vis_buf = deque()
+
+    with mp_face_mesh.FaceMesh(refine_landmarks=True, max_num_faces=1) as fm:
+        last = time.time()
+        eyes_closed = False
+        state = "NORMAL"
+
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            now = time.time()
+            break_warm = (now - START_TIME) >= BREAK_WARMUP_SEC
+
+
+            # ----- DEBUG key effects -----
+            if debug_reset:
+                fatigue_event_count = 0
+                debug_reset = False
+            if debug_force_plus1:
+                fatigue_event_count += 1
+                debug_force_plus1 = False
+                fatigue_event_count = min(fatigue_event_count, FATIGUE_EVENT_TRIGGER_N)
+
+                print(f"[DEBUG] fatigue_event_count = {fatigue_event_count}")
+            if debug_force_popup:
+                current_reco = random.sample(FATIGUE_PLANS_9, k=3)
+                last_intervention_time = now
+                debug_force_popup = False
+
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            res = fm.process(rgb)
+
+            if res.multi_face_landmarks:
+                missing_frames = 0
+                lm = res.multi_face_landmarks[0].landmark
+                h, w = frame.shape[:2]
+                def xy(i): return (lm[i].x * w, lm[i].y * h)
+
+                left = {"outer": xy(33), "inner": xy(133), "top": xy(159), "bottom": xy(145)}
+                right = {"outer": xy(362), "inner": xy(263), "top": xy(386), "bottom": xy(374)}
+                ear = (ear_for_eye(left) + ear_for_eye(right)) / 2.0
+                eyes_closed = ear < EAR_THRESH
+
+                mar = mouth_open_ratio(lm, w, h)
+                mouth_open_bin = 1 if mar > MAR_THRESH else 0
+
+                gx, gy = gaze_xy(lm, w, h)
+                hx, hy, hp = head_pose(lm, w, h)
+
+                vis_buf.append((now, {
+                    "GazeX": gx, "GazeY": gy,
+                    "HeadX": hx, "HeadY": hy, "HeadPitch": hp,
+                    "EyesClosed": 1 if eyes_closed else 0,
+                    "MouthOpenBin": mouth_open_bin,
+                    "MAR": float(mar)
+                }))
+            else:
+                missing_frames += 1
+
+            while vis_buf and vis_buf[0][0] < now - WINDOW_SEC:
+                vis_buf.popleft()
+
+            # ----- 5초마다 feature + decision -----
+            if now - last >= WINDOW_SEC:
+                last = now
+
+                task, input_event, scroll = agg.metrics()
+
+                closed_ratio = np.mean([v["EyesClosed"] for _, v in vis_buf]) if vis_buf else 0.0
+                eyes_open_ratio = float(1.0 - closed_ratio)
+
+                mouth_open_ratio_5s = float(np.mean([v["MouthOpenBin"] for _, v in vis_buf]) if vis_buf else 0.0)
+
+                avg = lambda k: float(np.mean([v[k] for _, v in vis_buf]) if vis_buf else 0.0)
+                latest_features = {
+                    "GazeX": avg("GazeX"),
+                    "GazeY": avg("GazeY"),
+                    "HeadX": avg("HeadX"),
+                    "HeadY": avg("HeadY"),
+                    "HeadPitch": avg("HeadPitch"),
+                    "Eyes": round(eyes_open_ratio, 3),
+                    "MouthOpen": round(mouth_open_ratio_5s, 3),
+                    "TaskInput": int(task),
+                    "InputEvent": float(input_event),
+                    "ScrollCnt": int(scroll),
+                    "LectureActive": int(lecture_active),
+                }
+
+                # feature_history에 8채널 벡터 추가
+                vec = normalize_feature_vec(latest_features)  # (8,)
+                feature_history.append(vec)
+
+                # --------------------------
+                # (1) Decision: CNN if possible
+                # --------------------------
+                decision_mode = "FALLBACK"
+                if model is not None and len(feature_history) == SEQ_STEPS:
+                    x = np.stack(list(feature_history), axis=0)  # (T, C)
+                    x = x.T  # (C, T)
+                    xt = torch.from_numpy(x).unsqueeze(0).to(DEVICE)  # (1,C,T)
+                    with torch.no_grad():
+                        logits = model(xt)
+                        probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]  # [p_normal,p_conscious,p_unconscious]
+                    last_probs = (float(probs[0]), float(probs[1]), float(probs[2]))
+                    decision_mode = "CNN"
+
+                    # CNN 기반 state/이벤트 판단
+                    p_normal, p_conscious, p_unconscious = last_probs
+                    # ==============================
+                    #  CNN 기반 무의식 이탈 판단 (STRICT)
+                    # ==============================
+
+                    # 5초 요약값
+                    eyes5 = float(latest_features.get("Eyes", 1.0))        # 0~1 (낮을수록 눈 감김 많음)
+                    yawn5 = float(latest_features.get("MouthOpen", 0.0))   # 0~1 (높을수록 하품)
+                    task5 = int(latest_features.get("TaskInput", 0))
+
+                    # ---- 무의식 이탈 게이트 (이거 없으면 절대 카운트 X) ----
+                    UNCON_EYES_GATE = 0.55    # 눈 감김 많음
+                    UNCON_YAWN_GATE = 0.60    # 하품
+
+                    has_eye_drift = eyes5 <= UNCON_EYES_GATE
+                    has_yawn      = yawn5 >= UNCON_YAWN_GATE
+
+                    uncon_gate = has_eye_drift or has_yawn
+
+                    # ---- 최종 판단 ----
+                    if (p_unconscious >= P_UNCONSCIOUS_THRESH) and uncon_gate:
+                        state = "UNCONSCIOUS_DRIFT"
+                        fatigue_event_count += 1
+                        fatigue_event_count = min(fatigue_event_count, FATIGUE_EVENT_TRIGGER_N)
+
+                        print(
+                            f"[CNN][UNCON] count={fatigue_event_count} "
+                            f"(p={p_unconscious:.2f}, eyes={eyes5:.2f}, yawn={yawn5:.2f})"
+                        )
+
+                    else:
+                            # ⚠️ 의식 이탈은 지금 단계에서 무시
+                        state = "NORMAL"
+                    
+                    
+                    # ======================
+                    # Character update logic
+                    # ======================
+                    if state == "UNCONSCIOUS_DRIFT":
+                        current_char = CHAR_UNCON.copy()
+                    else:
+                        current_char = CHAR_NORMAL.copy()
+
+
+
+                    #if p_unconscious >= P_UNCONSCIOUS_THRESH:
+                        #state = "UNCONSCIOUS_DRIFT"
+                        #fatigue_event_count += 1
+                        #fatigue_event_count = min(fatigue_event_count, FATIGUE_EVENT_TRIGGER_N)
+
+                        #print(f"[CNN] unconscious event -> count={fatigue_event_count} (p={p_unconscious:.2f})")
+                    #elif p_conscious >= P_CONSCIOUS_THRESH:
+                        #state = "CONSCIOUS_DRIFT"
+                        # 의식 이탈은 별도 카운트로 할 수도 있지만, 지금은 UI만
+                        #print(f"[CNN] conscious drift (p={p_conscious:.2f})")
+                    #else:
+                        #state = "NORMAL"
+
+                    # 30초 시퀀스 로깅(옵션)
+                    if logging_on:
+                        # jsonl 한 줄 저장 (학습용)
+                        import json
+                        sample = {
+                            "ts": now,
+                            "T": SEQ_STEPS,
+                            "channels": FEAT_NAMES,
+                            "x": np.stack(list(feature_history), axis=0).tolist(),  # (T, C)
+                            "meta": {
+                                "lecture_active": int(lecture_active),
+                            },
+                            "pseudo_label": int(np.argmax([p_normal, p_conscious, p_unconscious])),
+                            "probs": {"normal": p_normal, "conscious": p_conscious, "unconscious": p_unconscious},
+                        }
+                        append_jsonl(LOG_JSONL_PATH, sample)
+
+                else:
+                    # --------------------------
+                    # (2) Fallback: 기존 규칙 기반
+                    # --------------------------
+                    state_fb = update_state_fallback(eyes_closed)
+                    state = state_fb
+                    last_probs = None
+                    if state_fb in ("DROWSY", "SLEEP"):
+                        fatigue_event_count += 1
+                        fatigue_event_count = min(fatigue_event_count, FATIGUE_EVENT_TRIGGER_N)
+
+                        print(f"[FALLBACK] detected event -> count={fatigue_event_count}")
+                
+
+                                # --------------------------
+                # (2.5) Conscious breakaway trigger ---------
+        
+                face_missing_sec = missing_frames / FPS_ASSUMED
+                cond_missing = face_missing_sec >= FACE_MISSING_TRIGGER_SEC
+
+# ✅ 시연용: ←/→ 연타(10회 등) 감지
+                rewind_spam  = len(agg.rewind_keys)  >= SEEK_KEY_TRIGGER_N
+                forward_spam = len(agg.forward_keys) >= SEEK_KEY_TRIGGER_N
+                seek_spam = rewind_spam or forward_spam
+
+                break_reason = None
+                if cond_missing:
+                    break_reason = "MISSING"
+                elif seek_spam:
+                    break_reason = "SEEK_SPAM"
+
+                can_break_popup = (now - last_break_popup_time) >= BREAK_COOLDOWN_SEC
+                no_other_popup  = (current_reco is None) and (selected_plan_msg is None)
+                not_resting     = (rest_mode is False)
+                not_showing     = (break_popup is False)
+                break_warm      = (now - START_TIME) >= BREAK_WARMUP_SEC
+
+                if break_warm and (break_reason is not None) and can_break_popup and no_other_popup and not_resting and not_showing:
+                    break_popup = True
+                    last_break_popup_time = now
+                    play_ding()
+                    print(f"[BREAK_POPUP] reason={break_reason} (missing={face_missing_sec:.2f}s, seek_spam={int(seek_spam)})")
+
+
+
+
+
+                # --------------------------
+                # (3) Intervention trigger
+                # --------------------------
+                can_intervene = (now - last_intervention_time) >= INTERVENTION_COOLDOWN_SEC
+                popup_not_showing = (current_reco is None) and (not rest_mode)
+
+
+
+                if fatigue_event_count >= FATIGUE_EVENT_TRIGGER_N and can_intervene and popup_not_showing:
+                    current_reco = random.sample(FATIGUE_PLANS_9, k=3)
+                    last_intervention_time = now
+                    
+                    play_ding()
+
+                # 디버그 출력
+                print("\n[5-sec features]")
+                for k, v in latest_features.items():
+                    print(k, ":", v)
+                print("[mode]", decision_mode, "| state:", state)
+
+            # ----- UI (ONE PASS ONLY) -----
+            frame = draw_ui(frame, state, lecture_active, p=last_probs)
+            frame = draw_features(frame, latest_features)
+
+            cooldown_left = max(0.0, INTERVENTION_COOLDOWN_SEC - (now - last_intervention_time))
+            frame = draw_debug(frame, debug_overlay, fatigue_event_count, cooldown_left, logging_on)
+
+            # ✅ Rest mode가 최우선(화면 전체 분위기 바꾸기)
+            if rest_mode:
+                frame = draw_rest_mode(frame)
+
+            # ✅ break 팝업은 rest_mode가 아닐 때만
+            if (not rest_mode) and break_popup:
+                frame = draw_break_popup(frame)
+
+            # ✅ 선택 배너 (rest_mode 아닐 때만)
+            if (not rest_mode) and (selected_plan_msg is not None) and (now <= selected_plan_until):
+                frame = draw_selected_banner(frame, selected_plan_msg)
+            elif selected_plan_msg is not None and now > selected_plan_until:
+                selected_plan_msg = None
+
+# ✅ 계획 팝업은 제일 마지막 (rest_mode 아닐 때만)
+            if (not rest_mode) and (current_reco is not None):
+                frame = draw_intervention(frame, current_reco)
+            
+            # ======================
+            # Draw character (top-right)
+            # ======================
+            ch, cw = current_char.shape[:2]
+            x = frame.shape[1] - cw - 20
+            y = 100
+
+            if current_char.shape[2] == 4:  # BGRA
+                alpha = current_char[:, :, 3] / 255.0
+                for c in range(3):
+                    frame[y:y+ch, x:x+cw, c] = (
+                        alpha * current_char[:, :, c] +
+                        (1 - alpha) * frame[y:y+ch, x:x+cw, c]
+                    )
+            else:
+                frame[y:y+ch, x:x+cw] = current_char[:, :, :3]
+            
+            cv2.imshow(WINDOW_NAME, frame)
+
+            # ------------------------------
+            # 키 입력 처리 (cv2)
+            # ------------------------------
+            key = cv2.waitKey(1) & 0xFF
+
+                        # ------------------------------
+            # Rest mode key (최우선)
+            # ------------------------------
+            if rest_mode:
+                if key == ord('0'):
+                    rest_mode = False
+                    print("[REST] resume (0)")
+                # rest_mode에서는 나머지 입력은 무시(원하시면 ESC만 허용도 가능)
+                if key == 27:
+                    break
+                continue
+
+            # ------------------------------
+            # Break popup key (그 다음 우선)
+            # ------------------------------
+            if break_popup:
+                if key == ord('1'):
+                    # Yes -> Rest mode
+                    break_popup = False
+                    rest_mode = True
+                    print("[BREAK] Yes -> Rest mode")
+                elif key == ord('2'):
+                    # No -> dismiss
+                    break_popup = False
+                    print("[BREAK] No -> continue")
+                elif key == 27:
+                    break
+                # break_popup 떠 있을 때는 다른 키 처리(계획 1/2/3 등)로 내려가지 않게
+                continue
+
+
+            if key == 27:
+                break
+
+            # EAR 조절
+            if key == ord('['):
+                EAR_THRESH = max(0.10, EAR_THRESH - 0.01)
+            elif key == ord(']'):
+                EAR_THRESH = min(0.40, EAR_THRESH + 0.01)
+
+            # MAR 조절
+            elif key == ord(';'):
+                MAR_THRESH = max(0.10, MAR_THRESH - 0.02)
+            elif key == ord("'"):
+                MAR_THRESH = min(2.00, MAR_THRESH + 0.02)
+
+            # 팝업 선택
+            if current_reco is not None and key in (ord('1'), ord('2'), ord('3')):
+                idx = key - ord('1')
+                if 0 <= idx < len(current_reco):
+                    chosen = current_reco[idx]
+                    print(f"[SELECTED PLAN] {chosen}")
+                    selected_plan_msg = f"선택한 계획: {chosen}"
+                    selected_plan_until = now + SELECT_BANNER_SEC
+                    current_reco = None
+
+                    fatigue_event_count = 0
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
